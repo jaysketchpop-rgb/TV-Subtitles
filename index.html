@@ -106,7 +106,7 @@
     box-decoration-break: clone;
   }
   .line.old { opacity: 0.6; }
-  .line.interim { opacity: 0.85; font-weight: 400; }
+  .line.interim { opacity: 1; }
 
   .hint { max-width: 34em; margin: auto; text-align: center; color: var(--muted); font-size: 18px; line-height: 1.55; }
   .hint strong { color: var(--ink); }
@@ -147,19 +147,27 @@
   const stage = document.getElementById('stage');
   const statusEl = document.getElementById('status');
   const toggleBtn = document.getElementById('toggle');
-  const MAX_LINES = 2;      // finished lines kept on screen
-  const WORDS_PER_LINE = 12;
+  // Live-only captions: one line, just the words being spoken right now
+  const SHOW_WORDS = 10;        // words visible at once
+  const HIDE_AFTER_MS = 1500;   // clear the caption after this much silence
+  const SESSION_MS = 5000;      // restart recognition often so Safari stays fast
+  const MAX_SESSION_WORDS = 14; // or after this many words
 
   let rec = null;
   let wanted = false;       // user wants captions running
-  let finals = [];
+  let finals = [];          // kept for the Clear button; not shown
   let interim = '';
   let wakeLock = null;
+  let sessionStart = 0;
+  let hideTimer = null;
+  let captionEl = null;
+  let pendingText = null;
 
   function setStatus(text) { statusEl.textContent = text; }
 
   function showMessage(html, isError) {
     stage.innerHTML = '';
+    captionEl = null;
     const p = document.createElement('p');
     p.className = 'hint' + (isError ? ' error' : '');
     p.innerHTML = html;
@@ -171,51 +179,59 @@
     showMessage('This browser does not support live speech recognition. Open this page in <strong>Safari</strong> on iPad (iPadOS 14.5 or later) or in Chrome on a computer.', true);
   }
 
-  // Split long text into subtitle-sized chunks
-  function chunk(text) {
+  function lastWords(text) {
     const words = text.trim().split(/\s+/).filter(Boolean);
-    const out = [];
-    for (let i = 0; i < words.length; i += WORDS_PER_LINE) out.push(words.slice(i, i + WORDS_PER_LINE).join(' '));
-    return out;
+    return words.slice(-SHOW_WORDS).join(' ');
   }
 
-  function render() {
-    stage.innerHTML = '';
-    const shown = finals.slice(-MAX_LINES);
-    shown.forEach((t, i) => {
-      const p = document.createElement('p');
-      p.className = 'line' + (interim || i < shown.length - 1 ? ' old' : '');
-      p.textContent = t;
-      stage.appendChild(p);
-    });
-    if (interim) {
-      const words = interim.trim().split(/\s+/);
-      const p = document.createElement('p');
-      p.className = 'line interim';
-      p.textContent = words.slice(-WORDS_PER_LINE).join(' ');
-      stage.appendChild(p);
+  // Reuse one element and only change its text: much cheaper than rebuilding the page
+  function paint() {
+    const text = pendingText;
+    pendingText = null;
+    if (text === null) return;
+    if (!captionEl) {
+      stage.innerHTML = '';
+      captionEl = document.createElement('p');
+      captionEl.className = 'line';
+      stage.appendChild(captionEl);
     }
+    captionEl.textContent = text;
+    captionEl.style.visibility = text ? 'visible' : 'hidden';
   }
+
+  function show(text) {
+    const needsFrame = pendingText === null;
+    pendingText = text;
+    if (needsFrame) requestAnimationFrame(paint);
+    clearTimeout(hideTimer);
+    if (text) hideTimer = setTimeout(() => show(''), HIDE_AFTER_MS);
+  }
+
+  function render() { show(''); }
 
   function startRec() {
     rec = new SR();
     rec.lang = document.getElementById('lang').value;
     rec.continuous = true;
     rec.interimResults = true;
+    rec.maxAlternatives = 1;
+    sessionStart = Date.now();
+    const thisRec = rec;
 
     rec.onresult = (e) => {
-      let live = '';
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const text = e.results[i][0].transcript;
-        if (e.results[i].isFinal) {
-          finals.push(...chunk(text));
-          if (finals.length > 50) finals = finals.slice(-MAX_LINES);
-        } else {
-          live += text;
-        }
+      // Take only the newest result: that's what is being said right now
+      const r = e.results[e.results.length - 1];
+      const text = r[0].transcript;
+      if (!text.trim()) return;
+      interim = r.isFinal ? '' : text;
+      show(lastWords(text));
+
+      // Restart often: long sessions are what make Safari lag
+      let total = 0;
+      for (let i = 0; i < e.results.length; i++) total += e.results[i][0].transcript.trim().split(/\s+/).length;
+      if (Date.now() - sessionStart > SESSION_MS || total > MAX_SESSION_WORDS) {
+        try { thisRec.abort(); } catch (err) {}
       }
-      interim = live;
-      render();
     };
 
     rec.onerror = (e) => {
@@ -228,7 +244,8 @@
     };
 
     rec.onend = () => {
-      if (wanted) setTimeout(() => { if (wanted) startRec(); }, 250);
+      interim = '';
+      if (wanted && rec === thisRec) startRec(); // restart straight away, no gap
     };
 
     try { rec.start(); } catch (err) { /* already started */ }
@@ -261,7 +278,7 @@
       if (rec) rec.stop();
       if (wakeLock) { wakeLock.release(); wakeLock = null; }
       interim = '';
-      if (finals.length) render();
+      show('');
     }
   });
 
@@ -280,6 +297,7 @@
   document.getElementById('clear').addEventListener('click', () => {
     finals = []; interim = '';
     stage.innerHTML = '';
+    captionEl = null;
   });
 
   document.getElementById('hide').addEventListener('click', (e) => {
