@@ -147,28 +147,19 @@
   const stage = document.getElementById('stage');
   const statusEl = document.getElementById('status');
   const toggleBtn = document.getElementById('toggle');
-  // Live-only captions: one line, just the words being spoken right now
-  const SHOW_WORDS = 10;        // words visible at once
-  const HIDE_AFTER_MS = 1500;   // clear the caption after this much silence
-  const REFRESH_AFTER_MS = 45000; // refresh recognition, but only during a pause
+  const MAX_LINES = 2;      // finished lines kept on screen
+  const WORDS_PER_LINE = 12;
 
   let rec = null;
   let wanted = false;       // user wants captions running
-  let finals = [];          // kept for the Clear button; not shown
+  let finals = [];
   let interim = '';
   let wakeLock = null;
-  let sessionStart = 0;
-  let hideTimer = null;
-  let captionEl = null;
-  let pendingText = null;
-  let wordOffset = 0;       // words already shown before the last pause
-  let wordCount = 0;        // words heard so far in this session
 
   function setStatus(text) { statusEl.textContent = text; }
 
   function showMessage(html, isError) {
     stage.innerHTML = '';
-    captionEl = null;
     const p = document.createElement('p');
     p.className = 'hint' + (isError ? ' error' : '');
     p.innerHTML = html;
@@ -180,43 +171,52 @@
     showMessage('This browser does not support live speech recognition. Open this page in <strong>Safari</strong> on iPad (iPadOS 14.5 or later) or in Chrome on a computer.', true);
   }
 
-  // Reuse one element and only change its text
-  function paint() {
-    const text = pendingText;
-    pendingText = null;
-    if (text === null) return;
-    if (!captionEl) {
-      stage.innerHTML = '';
-      captionEl = document.createElement('p');
-      captionEl.className = 'line';
-      stage.appendChild(captionEl);
-    }
-    captionEl.textContent = text;
-    captionEl.style.visibility = text ? 'visible' : 'hidden';
+  // Split long text into subtitle-sized chunks
+  function chunk(text) {
+    const words = text.trim().split(/\s+/).filter(Boolean);
+    const out = [];
+    for (let i = 0; i < words.length; i += WORDS_PER_LINE) out.push(words.slice(i, i + WORDS_PER_LINE).join(' '));
+    return out;
   }
 
-  function setCaption(text) {
-    const needsFrame = pendingText === null;
-    pendingText = text;
-    if (needsFrame) requestAnimationFrame(paint);
-  }
-
-  function onPause() {
-    setCaption('');
-    wordOffset = wordCount;   // next caption starts with new words only
-    // Long sessions slow Safari down, so refresh during a quiet moment (no words lost)
-    if (wanted && rec && Date.now() - sessionStart > REFRESH_AFTER_MS) {
-      try { rec.stop(); } catch (err) {}
+  function render() {
+    stage.innerHTML = '';
+    const shown = finals.slice(-MAX_LINES);
+    shown.forEach((t, i) => {
+      const p = document.createElement('p');
+      p.className = 'line' + (interim || i < shown.length - 1 ? ' old' : '');
+      p.textContent = t;
+      stage.appendChild(p);
+    });
+    if (interim) {
+      const words = interim.trim().split(/\s+/);
+      const p = document.createElement('p');
+      p.className = 'line interim';
+      p.textContent = words.slice(-WORDS_PER_LINE).join(' ');
+      stage.appendChild(p);
     }
   }
 
-  function show(text) {
-    setCaption(text);
-    clearTimeout(hideTimer);
-    if (text) hideTimer = setTimeout(onPause, HIDE_AFTER_MS);
+  // Short recognition sessions stay fast on iPad Safari; long ones get slower and slower
+  const SESSION_MS = 8000;      // restart after ~8 s
+  const MAX_INTERIM_WORDS = 18; // or after this many unfinished words
+  let sessionStart = 0;
+  let renderQueued = false;
+  let gotFinal = false;
+
+  function queueRender() {
+    if (renderQueued) return;
+    renderQueued = true;
+    requestAnimationFrame(() => { renderQueued = false; render(); });
   }
 
-  function render() { show(''); }
+  function commitInterim() {
+    if (interim.trim()) {
+      finals.push(...chunk(interim));
+      if (finals.length > 50) finals = finals.slice(-MAX_LINES);
+    }
+    interim = '';
+  }
 
   function startRec() {
     rec = new SR();
@@ -225,22 +225,29 @@
     rec.interimResults = true;
     rec.maxAlternatives = 1;
     sessionStart = Date.now();
-    wordOffset = 0;
-    wordCount = 0;
-    const thisRec = rec;
+    gotFinal = false;
 
     rec.onresult = (e) => {
-      let full = '';
-      for (let i = 0; i < e.results.length; i++) full += ' ' + e.results[i][0].transcript;
-      const words = full.trim().split(/\s+/).filter(Boolean);
-      if (!words.length) return;
-      if (words.length < wordOffset) wordOffset = Math.max(0, words.length - SHOW_WORDS);
-      wordCount = words.length;
-      const fresh = words.slice(wordOffset);
-      if (!fresh.length) return;
-      // When a line fills up, start a new one instead of scrolling word by word
-      const start = Math.floor((fresh.length - 1) / SHOW_WORDS) * SHOW_WORDS;
-      show(fresh.slice(start).join(' '));
+      let live = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const text = e.results[i][0].transcript;
+        if (e.results[i].isFinal) {
+          finals.push(...chunk(text));
+          if (finals.length > 50) finals = finals.slice(-MAX_LINES);
+          gotFinal = true;
+        } else {
+          live += text;
+        }
+      }
+      interim = live;
+      queueRender();
+
+      // Keep sessions short so Safari doesn't bog down
+      const words = live.trim() ? live.trim().split(/\s+/).length : 0;
+      if (Date.now() - sessionStart > SESSION_MS || words > MAX_INTERIM_WORDS) {
+        commitInterim();
+        try { rec.abort(); } catch (err) {}
+      }
     };
 
     rec.onerror = (e) => {
@@ -249,10 +256,13 @@
         updateUI();
         showMessage('The microphone or speech recognition is blocked. Allow the microphone for Safari in Settings, and check that Dictation is turned on (Settings → General → Keyboard). Then reload this page.', true);
       }
+      // 'no-speech', 'aborted', 'network' just restart via onend
     };
 
     rec.onend = () => {
-      if (wanted && rec === thisRec) startRec(); // restart straight away
+      commitInterim();
+      queueRender();
+      if (wanted) startRec(); // restart straight away, no gap
     };
 
     try { rec.start(); } catch (err) { /* already started */ }
@@ -285,7 +295,7 @@
       if (rec) rec.stop();
       if (wakeLock) { wakeLock.release(); wakeLock = null; }
       interim = '';
-      show('');
+      if (finals.length) render();
     }
   });
 
@@ -304,7 +314,6 @@
   document.getElementById('clear').addEventListener('click', () => {
     finals = []; interim = '';
     stage.innerHTML = '';
-    captionEl = null;
   });
 
   document.getElementById('hide').addEventListener('click', (e) => {
