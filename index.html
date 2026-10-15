@@ -150,8 +150,7 @@
   // Live-only captions: one line, just the words being spoken right now
   const SHOW_WORDS = 10;        // words visible at once
   const HIDE_AFTER_MS = 1500;   // clear the caption after this much silence
-  const SESSION_MS = 5000;      // restart recognition often so Safari stays fast
-  const MAX_SESSION_WORDS = 14; // or after this many words
+  const REFRESH_AFTER_MS = 45000; // refresh recognition, but only during a pause
 
   let rec = null;
   let wanted = false;       // user wants captions running
@@ -162,6 +161,8 @@
   let hideTimer = null;
   let captionEl = null;
   let pendingText = null;
+  let wordOffset = 0;       // words already shown before the last pause
+  let wordCount = 0;        // words heard so far in this session
 
   function setStatus(text) { statusEl.textContent = text; }
 
@@ -179,12 +180,7 @@
     showMessage('This browser does not support live speech recognition. Open this page in <strong>Safari</strong> on iPad (iPadOS 14.5 or later) or in Chrome on a computer.', true);
   }
 
-  function lastWords(text) {
-    const words = text.trim().split(/\s+/).filter(Boolean);
-    return words.slice(-SHOW_WORDS).join(' ');
-  }
-
-  // Reuse one element and only change its text: much cheaper than rebuilding the page
+  // Reuse one element and only change its text
   function paint() {
     const text = pendingText;
     pendingText = null;
@@ -199,12 +195,25 @@
     captionEl.style.visibility = text ? 'visible' : 'hidden';
   }
 
-  function show(text) {
+  function setCaption(text) {
     const needsFrame = pendingText === null;
     pendingText = text;
     if (needsFrame) requestAnimationFrame(paint);
+  }
+
+  function onPause() {
+    setCaption('');
+    wordOffset = wordCount;   // next caption starts with new words only
+    // Long sessions slow Safari down, so refresh during a quiet moment (no words lost)
+    if (wanted && rec && Date.now() - sessionStart > REFRESH_AFTER_MS) {
+      try { rec.stop(); } catch (err) {}
+    }
+  }
+
+  function show(text) {
+    setCaption(text);
     clearTimeout(hideTimer);
-    if (text) hideTimer = setTimeout(() => show(''), HIDE_AFTER_MS);
+    if (text) hideTimer = setTimeout(onPause, HIDE_AFTER_MS);
   }
 
   function render() { show(''); }
@@ -216,22 +225,22 @@
     rec.interimResults = true;
     rec.maxAlternatives = 1;
     sessionStart = Date.now();
+    wordOffset = 0;
+    wordCount = 0;
     const thisRec = rec;
 
     rec.onresult = (e) => {
-      // Take only the newest result: that's what is being said right now
-      const r = e.results[e.results.length - 1];
-      const text = r[0].transcript;
-      if (!text.trim()) return;
-      interim = r.isFinal ? '' : text;
-      show(lastWords(text));
-
-      // Restart often: long sessions are what make Safari lag
-      let total = 0;
-      for (let i = 0; i < e.results.length; i++) total += e.results[i][0].transcript.trim().split(/\s+/).length;
-      if (Date.now() - sessionStart > SESSION_MS || total > MAX_SESSION_WORDS) {
-        try { thisRec.abort(); } catch (err) {}
-      }
+      let full = '';
+      for (let i = 0; i < e.results.length; i++) full += ' ' + e.results[i][0].transcript;
+      const words = full.trim().split(/\s+/).filter(Boolean);
+      if (!words.length) return;
+      if (words.length < wordOffset) wordOffset = Math.max(0, words.length - SHOW_WORDS);
+      wordCount = words.length;
+      const fresh = words.slice(wordOffset);
+      if (!fresh.length) return;
+      // When a line fills up, start a new one instead of scrolling word by word
+      const start = Math.floor((fresh.length - 1) / SHOW_WORDS) * SHOW_WORDS;
+      show(fresh.slice(start).join(' '));
     };
 
     rec.onerror = (e) => {
@@ -240,12 +249,10 @@
         updateUI();
         showMessage('The microphone or speech recognition is blocked. Allow the microphone for Safari in Settings, and check that Dictation is turned on (Settings → General → Keyboard). Then reload this page.', true);
       }
-      // 'no-speech', 'aborted', 'network' just restart via onend
     };
 
     rec.onend = () => {
-      interim = '';
-      if (wanted && rec === thisRec) startRec(); // restart straight away, no gap
+      if (wanted && rec === thisRec) startRec(); // restart straight away
     };
 
     try { rec.start(); } catch (err) { /* already started */ }
